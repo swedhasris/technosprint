@@ -1004,7 +1004,7 @@ async function startServer() {
         try {
           await OmniChannelEngine.sendEmail(
             createdTicket.caller,
-            `Ticket Created: ${createdTicket.ticket_number} - ${createdTicket.title}`,
+            `[TK-${createdTicket.ticket_number.replace('INC', '')}] Ticket Created: ${createdTicket.title}`,
             `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px;">
               <h2 style="color: #2563eb;">Incident Created</h2>
               <p>Hello,</p>
@@ -1068,6 +1068,17 @@ async function startServer() {
     } catch (error: any) {
       console.error("Error creating ticket:", error);
       res.status(500).json({ error: "Failed to create ticket: " + error.message });
+    }
+  });
+
+  app.post("/api/email/send-note", async (req, res) => {
+    try {
+      const { to, subject, body, attachments } = req.body;
+      await OmniChannelEngine.sendEmail(to, subject, body, attachments);
+      res.json({ message: "Email sent successfully" });
+    } catch (error: any) {
+      console.error("[Email] Send note failed:", error);
+      res.status(500).json({ error: "Failed to send email" });
     }
   });
 
@@ -1156,7 +1167,7 @@ async function startServer() {
           if (ticket.caller && ticket.caller.includes('@')) {
             await OmniChannelEngine.sendEmail(
               ticket.caller,
-              `Ticket Status Updated: ${ticket.ticket_number}`,
+              `[TK-${ticket.ticket_number.replace('INC', '')}] Ticket Status Updated`,
               `<div style="font-family: sans-serif; padding: 20px;">
                 <h2 style="color: #2563eb;">Status Update</h2>
                 <p>Hello,</p>
@@ -1184,7 +1195,7 @@ async function startServer() {
           if (assignedAgent.length > 0 && assignedAgent[0].email) {
             await OmniChannelEngine.sendEmail(
               assignedAgent[0].email,
-              `New Ticket Assigned: ${ticket.ticket_number}`,
+              `[TK-${ticket.ticket_number.replace('INC', '')}] New Ticket Assigned`,
               `<div style="font-family: sans-serif; padding: 20px;">
                 <h2 style="color: #2563eb;">New Assignment</h2>
                 <p>A new ticket has been assigned to you.</p>
@@ -1206,6 +1217,16 @@ async function startServer() {
     } catch (error: any) {
       console.error("Error updating ticket:", error);
       res.status(500).json({ error: "Failed to update ticket" });
+    }
+  });
+
+  app.delete("/api/tickets/all", async (req, res) => {
+    try {
+      await execute("DELETE FROM tickets");
+      res.json({ message: "All tickets deleted successfully" });
+    } catch (error: any) {
+      console.error("Error deleting all tickets:", error);
+      res.status(500).json({ error: "Failed to delete all tickets" });
     }
   });
 

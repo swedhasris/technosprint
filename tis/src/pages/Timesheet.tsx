@@ -317,7 +317,7 @@ export function Timesheet() {
   }, []);
 
   // Email section
-  const [emailFrom, setEmailFrom] = useState("");
+  const [emailFrom, setEmailFrom] = useState("Support@technosprint.net");
   const [emailContact, setEmailContact] = useState(true);
   const [emailContactName, setEmailContactName] = useState("");
   const [emailResources, setEmailResources] = useState(false);
@@ -460,7 +460,7 @@ export function Timesheet() {
       console.error("[Timesheet] Error loading data:", e);
       alert(`Failed to load timesheet: ${e.message}`);
     } finally {
-      setEmailFrom(profile?.name || user?.email || "");
+      setEmailFrom("Support@technosprint.net");
       setEmailContactName(profile?.name || "");
       setLoading(false);
     }
@@ -627,15 +627,34 @@ export function Timesheet() {
     }
   }
 
-  function handleSendEmail() {
-    // Build mailto link
-    const subject = encodeURIComponent(`Timesheet Notes — ${entryDate}`);
-    const body = encodeURIComponent(notesContent || waMessage);
-    window.open(`mailto:?subject=${subject}&body=${body}`, "_blank");
+  async function handleSendEmail() {
+    try {
+      const subject = `Timesheet Notes — ${entryDate}`;
+      const body = notesContent || waMessage;
+      
+      const res = await fetch("/api/email/send-note", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: emailCcEmails, // or other recipients based on checkboxes
+          subject,
+          body,
+          attachments: emailClipboard ? [{
+            filename: emailClipboard.label,
+            url: emailClipboard.value // Note: server needs to handle data URLs or I should upload first
+          }] : []
+        })
+      });
 
-    // Save to history
-    const recipient = emailContactName || emailFrom || "Contact";
-    saveMessageHistory("email", recipient, notesContent || waMessage);
+      if (!res.ok) throw new Error("Failed to send email");
+
+      alert("Email sent successfully!");
+      // Save to history
+      const recipient = emailCcEmails || "Contact";
+      saveMessageHistory("email", recipient, body);
+    } catch (e: any) {
+      alert("Error: " + e.message);
+    }
   }
 
   async function pasteFromClipboard(target: "email" | "whatsapp") {

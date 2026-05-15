@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { collection, addDoc, query, onSnapshot, updateDoc, doc, serverTimestamp, orderBy, where, deleteDoc } from "firebase/firestore";
+import { collection, addDoc, query, onSnapshot, updateDoc, doc, serverTimestamp, orderBy, where, deleteDoc, getDocs } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../lib/firebase";
 import { useAuth } from "../contexts/AuthContext";
 import { ROLE_HIERARCHY, Role } from "../lib/roles";
@@ -613,9 +613,31 @@ export function Tickets() {
           <h1 className="text-3xl font-bold tracking-tight">Tickets</h1>
           <p className="text-muted-foreground">Manage and track IT support requests.</p>
         </div>
-        <Button onClick={() => openModal()} className="bg-sn-green text-sn-dark font-bold">
-          <Plus className="w-4 h-4 mr-2" /> Create Ticket
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="destructive"
+            className="font-bold"
+            onClick={async () => {
+              if (!window.confirm("Delete ALL tickets permanently?")) return;
+              try {
+                const snap = await getDocs(collection(db, "tickets"));
+                for (const d of snap.docs) {
+                  await deleteDoc(doc(db, "tickets", d.id));
+                }
+                alert("Cleaned " + snap.size + " tickets from Firestore.");
+                // Also call SQL delete via API
+                await fetch("/api/tickets/all", { method: "DELETE" }).catch(() => {});
+              } catch (e) {
+                alert(e.message);
+              }
+            }}
+          >
+            <Trash2 className="w-4 h-4 mr-2" /> Delete All
+          </Button>
+          <Button onClick={() => openModal()} className="bg-sn-green text-sn-dark font-bold">
+            <Plus className="w-4 h-4 mr-2" /> Create Ticket
+          </Button>
+        </div>
       </div>
 
       <div className="sn-card overflow-hidden p-0">

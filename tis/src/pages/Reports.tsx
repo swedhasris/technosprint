@@ -324,7 +324,7 @@ function IncidentMapView({ tickets }: { tickets: any[] }) {
             </div>
           ))
         ) : (
-        {groupedData.map(group => {
+        groupedData.map(group => {
           const criticalCount = group.items.filter((t: any) => t.priority?.includes("Critical")).length;
           const highCount = group.items.filter((t: any) => t.priority?.includes("High")).length;
           const breachedCount = group.items.filter(
@@ -454,7 +454,8 @@ function IncidentMapView({ tickets }: { tickets: any[] }) {
               </div>
             </div>
           );
-        }))}
+        })
+        )}
       </div>
 
       {/* Legend */}
