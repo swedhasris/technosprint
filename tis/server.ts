@@ -15,6 +15,9 @@ import { SLAEngine } from "./src/lib/slaEngine";
 import { uIOhook } from "uiohook-napi";
 import { setUseSQLite } from "./src/lib/db";
 import { NotificationEngine } from "./src/lib/notificationEngine";
+import nodemailer from 'nodemailer';
+import imaps from 'imap-simple';
+
 
 // SQLite will be imported dynamically when needed
 
@@ -96,9 +99,11 @@ async function getSQLiteDb() {
         resolution_sla_status TEXT,
         created_by TEXT,
         created_by_name TEXT,
+        company_id INTEGER,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+
       CREATE TABLE IF NOT EXISTS activity_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
@@ -199,6 +204,24 @@ async function getSQLiteDb() {
         is_read INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+      CREATE TABLE IF NOT EXISTS company_email_configs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_name TEXT NOT NULL,
+        email_address TEXT NOT NULL UNIQUE,
+        smtp_host TEXT NOT NULL,
+        smtp_port INTEGER NOT NULL,
+        smtp_user TEXT NOT NULL,
+        smtp_pass TEXT NOT NULL,
+        imap_host TEXT NOT NULL,
+        imap_port INTEGER NOT NULL,
+        imap_user TEXT NOT NULL,
+        imap_pass TEXT NOT NULL,
+        encryption TEXT DEFAULT 'TLS',
+        is_active INTEGER DEFAULT 1,
+        is_default INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
       CREATE TABLE IF NOT EXISTS custom_dropdowns (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -232,17 +255,78 @@ async function getSQLiteDb() {
         UNIQUE(company_id, feature_id)
       );
     `);
-    // Migrate: add screenshot_url column if missing (safe to re-run)
+
+    // ═══ Enterprise Email System Tables ═══
+    await sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS email_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticket_id INTEGER,
+        ticket_number TEXT,
+        direction TEXT NOT NULL DEFAULT 'outbound',
+        recipient TEXT,
+        sender TEXT,
+        subject TEXT,
+        body_preview TEXT,
+        message_id TEXT,
+        in_reply_to TEXT,
+        references_header TEXT,
+        status TEXT DEFAULT 'pending',
+        provider_response TEXT,
+        error_message TEXT,
+        retry_count INTEGER DEFAULT 0,
+        max_retries INTEGER DEFAULT 5,
+        next_retry_at DATETIME,
+        email_type TEXT DEFAULT 'notification',
+        config_id INTEGER,
+        sent_at DATETIME,
+        received_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS email_threads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticket_id INTEGER NOT NULL,
+        ticket_number TEXT NOT NULL,
+        thread_id TEXT UNIQUE NOT NULL,
+        original_message_id TEXT,
+        subject TEXT,
+        last_message_id TEXT,
+        message_count INTEGER DEFAULT 1,
+        participants TEXT DEFAULT '[]',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS notifications_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL,
+        ticket_id INTEGER,
+        ticket_number TEXT,
+        recipient TEXT NOT NULL,
+        subject TEXT,
+        body_html TEXT,
+        status TEXT DEFAULT 'pending',
+        priority INTEGER DEFAULT 5,
+        retry_count INTEGER DEFAULT 0,
+        max_retries INTEGER DEFAULT 5,
+        next_retry_at DATETIME,
+        error_message TEXT,
+        config_id INTEGER,
+        metadata_json TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        processed_at DATETIME
+      );
+      CREATE INDEX IF NOT EXISTS idx_email_logs_ticket ON email_logs(ticket_id);
+      CREATE INDEX IF NOT EXISTS idx_email_logs_status ON email_logs(status);
+      CREATE INDEX IF NOT EXISTS idx_email_threads_ticket ON email_threads(ticket_id);
+      CREATE INDEX IF NOT EXISTS idx_notif_queue_status ON notifications_queue(status);
+    `);
+
+    // Migrate columns safely
     try { await sqliteDb.exec("ALTER TABLE timesheets ADD COLUMN screenshot_url TEXT;"); } catch (e) {}
-    // Ensure tables have latest columns
-    try {
-      await sqliteDb.exec("ALTER TABLE activity_entries ADD COLUMN keystrokes INTEGER DEFAULT 0");
-    } catch (e) {}
-    try {
-      await sqliteDb.exec("ALTER TABLE activity_entries ADD COLUMN clicks INTEGER DEFAULT 0");
-    } catch (e) {}
+    try { await sqliteDb.exec("ALTER TABLE activity_entries ADD COLUMN keystrokes INTEGER DEFAULT 0"); } catch (e) {}
+    try { await sqliteDb.exec("ALTER TABLE activity_entries ADD COLUMN clicks INTEGER DEFAULT 0"); } catch (e) {}
+    try { await sqliteDb.exec("ALTER TABLE users ADD COLUMN last_login DATETIME"); } catch (e) {}
     
-    console.log('[SQLite] Timesheet database initialized');
+    console.log('[SQLite] Database initialized with enterprise email tables');
   }
   return sqliteDb;
 }
@@ -1354,7 +1438,8 @@ async function startServer() {
         return 'h_' + Math.abs(hash).toString(36) + '_' + str.length;
       }
 
-      const users = await query("SELECT * FROM users WHERE email = ? AND is_active = TRUE", [email.toLowerCase().trim()]);
+      const users = await query("SELECT * FROM users WHERE email = ? AND is_active = 1", [email.toLowerCase().trim()]);
+
 
       if (users.length === 0) {
         return res.status(401).json({ error: "Invalid email or password" });
@@ -1452,7 +1537,54 @@ async function startServer() {
       }
 
       const activities = await query("SELECT * FROM ticket_activities WHERE id = ?", [result.insertId]);
+      
+      // ═══ CUSTOMER NOTIFICATION LOGIC ═══
+      if (visType === 'public' && actType !== 'system') {
+        try {
+          // 1. Fetch ticket details
+          const ticketRows = await query("SELECT ticket_number, caller, title, company_id FROM tickets WHERE id = ?", [id]);
+          if (ticketRows.length > 0) {
+            const ticket = ticketRows[0];
+            
+            // 2. Fetch company email config
+            let configRows = [];
+            if (ticket.company_id) {
+              configRows = await query("SELECT * FROM company_email_configs WHERE id = ?", [ticket.company_id]);
+            } else {
+              // Fallback to default
+              configRows = await query("SELECT * FROM company_email_configs WHERE is_active = 1 ORDER BY is_default DESC LIMIT 1");
+            }
+
+            if (configRows.length > 0) {
+              const config = configRows[0];
+              const ticketNum = ticket.ticket_number;
+              const cleanNum = ticketNum.replace('INC', '');
+              
+              await OmniChannelEngine.sendEmailByConfig(
+                config,
+                ticket.caller,
+                `[TK-${cleanNum}] Update: ${ticket.title}`,
+                `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px;">
+                  <h2 style="color: #2563eb;">${config.company_name} Support</h2>
+                  <p>Hello,</p>
+                  <p>A new update has been added to your support ticket <strong>TK-${cleanNum}</strong>.</p>
+                  <div style="background-color: #f8fafc; padding: 15px; border-radius: 6px; margin: 20px 0; border: 1px solid #e2e8f0; white-space: pre-wrap;">
+                    ${message.trim()}
+                  </div>
+                  <p style="font-size: 14px; color: #64748b;">You can reply to this email to add more information to your ticket.</p>
+                  <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;">
+                  <p style="font-size: 11px; color: #94a3b8;">Ref ID: [TK-${cleanNum}] | Message sent via ${config.email_address}</p>
+                </div>`
+              );
+            }
+          }
+        } catch (emailErr) {
+          console.error("[Email Notification] Failed to send update email:", emailErr);
+        }
+      }
+
       res.json({ id: result.insertId.toString(), ...activities[0] });
+
     } catch (error: any) {
       console.error("Error adding activity:", error);
       res.status(500).json({ error: "Failed to add activity" });
@@ -2631,7 +2763,180 @@ Respond ONLY with JSON: {"summary": "your summary here"}`;
     }
   });
 
+  // ═══ COMPANY EMAIL CONFIGURATIONS (Ultra Super Admin) ═══
+  app.get("/api/email-configs", async (req, res) => {
+    try {
+      const rows = await query("SELECT * FROM company_email_configs ORDER BY created_at DESC");
+      res.json(rows);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/email-configs", async (req, res) => {
+    try {
+      const data = req.body;
+      const fields = Object.keys(data);
+      const placeholders = fields.map(() => '?').join(', ');
+      const values = fields.map(k => data[k]);
+
+      // If setting as default, unset others
+      if (data.is_default) {
+        await execute("UPDATE company_email_configs SET is_default = 0");
+      }
+
+      const result = await execute(
+        `INSERT INTO company_email_configs (${fields.join(', ')}) VALUES (${placeholders})`,
+        values
+      );
+      res.json({ id: result.insertId, ...data });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.put("/api/email-configs/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const data = req.body;
+      const fields = Object.keys(data).filter(k => k !== 'id' && k !== 'created_at');
+      const setClause = fields.map(k => `${k} = ?`).join(', ');
+      const values = [...fields.map(k => data[k]), id];
+
+      if (data.is_default) {
+        await execute("UPDATE company_email_configs SET is_default = 0 WHERE id != ?", [id]);
+      }
+
+      await execute(`UPDATE company_email_configs SET ${setClause}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, values);
+      res.json({ id, ...data });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete("/api/email-configs/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      await execute("DELETE FROM company_email_configs WHERE id = ?", [id]);
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/email-configs/test", async (req, res) => {
+    try {
+      const config = req.body;
+      // Test SMTP
+      const transporter = nodemailer.createTransport({
+        host: config.smtp_host,
+        port: config.smtp_port,
+        secure: config.smtp_port === 465,
+        auth: { user: config.smtp_user, pass: config.smtp_pass },
+        tls: { rejectUnauthorized: false }
+      });
+      await transporter.verify();
+
+      // Test IMAP
+      const imapConfig = {
+        imap: {
+          user: config.imap_user,
+          password: config.imap_pass,
+          host: config.imap_host,
+          port: config.imap_port,
+          tls: config.encryption !== 'None',
+          tlsOptions: { rejectUnauthorized: false },
+          authTimeout: 10000,
+        }
+      };
+      const connection = await imaps.connect(imapConfig);
+      connection.end();
+
+      res.json({ success: true, message: "SMTP and IMAP connections successful!" });
+    } catch (error: any) {
+
+      console.error("[Email Test] Failed:", error.message);
+      res.status(500).json({ error: "Connection failed", detail: error.message });
+    }
+  });
+
+  // ═══ ENTERPRISE EMAIL ENGINE ENDPOINTS ═══
+  const { getEmailHealth, processEmailQueue, logEmail, enqueueEmail } = await import('./src/lib/emailEngine');
+
+  // Health check
+  app.get("/api/email/health", async (req, res) => {
+    try { res.json(await getEmailHealth()); }
+    catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Email logs
+  app.get("/api/email/logs", async (req, res) => {
+    try {
+      const { ticket_id, direction, status, limit: lim = '50' } = req.query as any;
+      let sql = "SELECT * FROM email_logs WHERE 1=1";
+      const params: any[] = [];
+      if (ticket_id) { sql += " AND ticket_id = ?"; params.push(ticket_id); }
+      if (direction) { sql += " AND direction = ?"; params.push(direction); }
+      if (status) { sql += " AND status = ?"; params.push(status); }
+      sql += " ORDER BY created_at DESC LIMIT ?";
+      params.push(parseInt(lim));
+      res.json(await query(sql, params));
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Queue status
+  app.get("/api/email/queue", async (req, res) => {
+    try {
+      const items = await query("SELECT * FROM notifications_queue ORDER BY created_at DESC LIMIT 50");
+      const stats = await query(`SELECT status, COUNT(*) as count FROM notifications_queue GROUP BY status`);
+      res.json({ items, stats });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Process queue manually
+  app.post("/api/email/queue/process", async (req, res) => {
+    try { await processEmailQueue(); res.json({ success: true }); }
+    catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Retry failed emails
+  app.post("/api/email/queue/retry-failed", async (req, res) => {
+    try {
+      await execute("UPDATE notifications_queue SET status = 'retry', retry_count = 0, next_retry_at = NULL WHERE status = 'failed'");
+      res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Send test email
+  app.post("/api/email/send-test", async (req, res) => {
+    try {
+      const { to } = req.body;
+      const configs = await query("SELECT * FROM company_email_configs WHERE is_active = 1 ORDER BY is_default DESC LIMIT 1");
+      if (configs.length === 0) return res.status(400).json({ error: "No active email config" });
+      const c = configs[0];
+      const transporter = nodemailer.createTransport({ host: c.smtp_host, port: c.smtp_port, secure: c.smtp_port===465, auth:{user:c.smtp_user,pass:c.smtp_pass}, tls:{rejectUnauthorized:false} });
+      await transporter.sendMail({
+        from: `"${c.company_name} Support" <${c.email_address}>`, to: to || c.email_address,
+        subject: `[TEST] Ticklora Email Integration Test - ${new Date().toLocaleString()}`,
+        html: `<div style="font-family:sans-serif;padding:20px"><h2>✅ Email Integration Working!</h2><p>This test confirms your Ticklora email system is operational.</p><p><strong>Config:</strong> ${c.company_name}<br><strong>SMTP:</strong> ${c.smtp_host}:${c.smtp_port}<br><strong>Time:</strong> ${new Date().toISOString()}</p></div>`
+      });
+      await logEmail({ direction: 'outbound', recipient: to || c.email_address, sender: c.email_address, subject: 'Test Email', status: 'sent', email_type: 'test', config_id: c.id, sent_at: new Date().toISOString() });
+      res.json({ success: true, message: `Test email sent to ${to || c.email_address}` });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Email thread info for a ticket
+  app.get("/api/email/threads/:ticketNumber", async (req, res) => {
+    try {
+      const threads = await query("SELECT * FROM email_threads WHERE ticket_number = ?", [req.params.ticketNumber]);
+      const logs = await query("SELECT * FROM email_logs WHERE ticket_number = ? ORDER BY created_at DESC", [req.params.ticketNumber]);
+      res.json({ threads, logs });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
   // ═══ MASTER DATA APIS ═══
+
+
 
   const VALID_MASTER_TABLES = [
     'mst_groups', 'mst_statuses', 'mst_roles', 'mst_departments', 
@@ -3140,22 +3445,28 @@ Please respond appropriately as a helpful IT assistant.`,
     console.log(`[MySQL] Database: ${dbConfig.database} at ${dbConfig.host}:${dbConfig.port}`);
     
     // OmniChannel polling
-    console.log('[OmniChannel] Polling emails...');
+    console.log('[OmniChannel] Starting email services...');
     OmniChannelEngine.pollIncomingEmails();
     
-    cron.schedule('*/30 * * * * *', () => {
+    // Enterprise Email Queue - process every 30s
+    cron.schedule('*/30 * * * * *', async () => {
+      try { await processEmailQueue(); } catch {}
       OmniChannelEngine.processNotificationQueue();
     });
 
+    // IMAP Polling - every 1 minute
     cron.schedule('*/1 * * * *', () => {
-      console.log('[OmniChannel] Polling emails...');
+      console.log('[OmniChannel] Polling inbound emails...');
       OmniChannelEngine.pollIncomingEmails();
     });
     
+    // SLA Monitoring - every hour
     cron.schedule('0 * * * *', () => {
       console.log('[SLAEngine] Monitoring SLA breaches...');
       SLAEngine.monitorBreaches();
     });
+
+    console.log('[Enterprise] ✓ Email queue, IMAP polling, SLA engine started');
   });
 }
 
