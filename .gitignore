@@ -1,0 +1,24 @@
+node_modules
+dist
+.env
+*.db
+*.sqlite
+.DS_Store
+*.log
+.gemini
+tmp
+scratch
+demo-mysql-1
+nexus-demo
+public/captures
+public/uploads
+
+# Laravel
+connectit-laravel/vendor
+connectit-laravel/storage/logs
+connectit-laravel/storage/framework/cache
+connectit-laravel/storage/framework/sessions
+connectit-laravel/storage/framework/views
+connectit-laravel/bootstrap/cache
+connectit-laravel/test_email.php
+connectit-laravel/test_job.php
